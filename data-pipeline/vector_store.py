@@ -1,7 +1,9 @@
 import json
 import logging
 import numpy as np
+import time
 import redis
+import os
 from sentence_transformers import SentenceTransformer
 from config import (
     REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_PASSWORD,
@@ -14,23 +16,59 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger('vector_store')
 
 class VectorStore:
-    def __init__(self):
+    def __init__(self, max_retries=5, retry_delay=10):
         """Initialize the vector store with Redis and embedding model"""
-        # Connect to Redis
-        self.redis_client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=REDIS_DB,
-            password=REDIS_PASSWORD,
-            decode_responses=False  # Keep binary for vector data
-        )
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.redis_client = None
+        self.model = None
+        
+        # Connect to Redis with retries
+        self.connect_redis()
         
         # Initialize the embedding model
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
-        self.model = SentenceTransformer(EMBEDDING_MODEL)
+        self.initialize_model()
         
         # Create Redis Search index if it doesn't exist
         self._create_index()
+    
+    def connect_redis(self):
+        """Connect to Redis with retries"""
+        for attempt in range(self.max_retries):
+            try:
+                logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}, attempt {attempt+1}")
+                self.redis_client = redis.Redis(
+                    host=REDIS_HOST,
+                    port=REDIS_PORT,
+                    db=REDIS_DB,
+                    password=REDIS_PASSWORD,
+                    decode_responses=False,  # Keep binary for vector data
+                    socket_timeout=5,
+                    socket_connect_timeout=5
+                )
+                
+                # Test connection
+                self.redis_client.ping()
+                logger.info("Successfully connected to Redis")
+                return
+            except redis.exceptions.ConnectionError:
+                logger.warning(f"Could not connect to Redis. Retrying in {self.retry_delay} seconds...")
+                time.sleep(self.retry_delay)
+            except Exception as e:
+                logger.error(f"Error connecting to Redis: {e}")
+                time.sleep(self.retry_delay)
+        
+        raise ConnectionError(f"Failed to connect to Redis after {self.max_retries} attempts")
+    
+    def initialize_model(self):
+        """Initialize the embedding model with error handling"""
+        try:
+            logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
+            self.model = SentenceTransformer(EMBEDDING_MODEL)
+            logger.info("Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading embedding model: {e}")
+            raise
     
     def _create_index(self):
         """Create Redis Search index for vector search"""
@@ -40,9 +78,12 @@ class VectorStore:
                 self.redis_client.execute_command("FT.INFO", REDIS_INDEX_NAME)
                 logger.info(f"Index {REDIS_INDEX_NAME} already exists")
                 return
-            except redis.exceptions.ResponseError:
+            except redis.exceptions.ResponseError as e:
+                if "unknown index name" not in str(e).lower():
+                    logger.error(f"Unexpected Redis error: {e}")
+                    raise
                 # Index doesn't exist, continue to creation
-                pass
+                logger.info(f"Index {REDIS_INDEX_NAME} doesn't exist, creating it...")
             
             # Create the index with vector search capabilities
             self.redis_client.execute_command(
@@ -69,6 +110,12 @@ class VectorStore:
         if not text or len(text.strip()) == 0:
             raise ValueError("Cannot generate embedding for empty text")
         
+        # Truncate extremely long texts to avoid memory issues
+        max_length = 10000  # Maximum number of characters
+        if len(text) > max_length:
+            logger.warning(f"Text truncated from {len(text)} to {max_length} characters")
+            text = text[:max_length]
+        
         embedding = self.model.encode(text)
         return embedding
     
@@ -83,78 +130,3 @@ class VectorStore:
             
             # Prepare data for Redis
             redis_data = {
-                "title": article_data.get("title", ""),
-                "text": article_data.get("text", ""),
-                "summary": article_data.get("summary", ""),
-                "url": article_data.get("url", ""),
-                "source": article_data.get("source", ""),
-                "category": article_data.get("category", "general"),
-                "authors": json.dumps(article_data.get("authors", [])),
-                "publish_date": article_data.get("publish_date", ""),
-                "embedding": embedding_bytes
-            }
-            
-            # Store in Redis
-            self.redis_client.hset(f"article:{article_id}", mapping=redis_data)
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error storing article {article_id} in Redis: {e}")
-            return False
-    
-    def search_similar(self, query_text, limit=5, filters=None):
-        """Search for similar articles using vector similarity"""
-        try:
-            # Generate embedding for query
-            query_embedding = self.generate_embedding(query_text)
-            
-            # Convert to bytes for Redis query
-            query_embedding_bytes = np.array(query_embedding, dtype=np.float32).tobytes()
-            
-            # Build query
-            base_query = f"*=>[KNN {limit} @embedding $query_vector AS score]"
-            
-            # Add filters if provided
-            if filters:
-                filter_parts = []
-                for key, value in filters.items():
-                    filter_parts.append(f"@{key}:{{{value}}}")
-                
-                if filter_parts:
-                    filter_str = " ".join(filter_parts)
-                    base_query = f"{filter_str} {base_query}"
-            
-            # Execute vector search
-            results = self.redis_client.execute_command(
-                "FT.SEARCH", REDIS_INDEX_NAME,
-                base_query,
-                "PARAMS", "2", "query_vector", query_embedding_bytes,
-                "RETURN", "6", "title", "summary", "url", "source", "category", "score",
-                "SORTBY", "score", "ASC"
-            )
-            
-            # Parse results
-            parsed_results = []
-            if results and len(results) > 1:  # First element is count
-                # Skip the first element (count) and process pairs
-                for i in range(1, len(results), 2):
-                    article_id = results[i].decode('utf-8')
-                    properties = results[i+1]
-                    
-                    # Convert to dict for easier handling
-                    result_dict = {}
-                    for j in range(0, len(properties), 2):
-                        key = properties[j].decode('utf-8')
-                        value = properties[j+1].decode('utf-8') if properties[j+1] else ""
-                        result_dict[key] = value
-                    
-                    # Add article_id (without the 'article:' prefix)
-                    result_dict['id'] = article_id.replace('article:', '')
-                    
-                    parsed_results.append(result_dict)
-            
-            return parsed_results
-            
-        except Exception as e:
-            logger.error(f"Error searching in Redis: {e}")
-            return []

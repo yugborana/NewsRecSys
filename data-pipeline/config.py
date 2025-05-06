@@ -16,18 +16,22 @@ REDIS_INDEX_NAME = 'news_articles_idx'
 EMBEDDING_MODEL = 'sentence-transformers/msmarco-distilbert-base-v4'
 VECTOR_SIZE = 768
 
-# News sources and topics
+# Newspaper cache
+NEWSPAPER_CACHE_DIR = os.environ.get('NEWSPAPER_CACHE_DIR', '/tmp/newspaper-cache')
+# Ensure cache directory exists
+if not os.path.exists(NEWSPAPER_CACHE_DIR):
+    try:
+        os.makedirs(NEWSPAPER_CACHE_DIR, exist_ok=True)
+    except:
+        pass
+
+# News sources and topics - selected sources that work better with newspaper3k
 NEWS_SOURCES = [
-    'https://www.cnn.com',
-    'https://www.bbc.com',
     'https://www.reuters.com',
-    'https://www.nytimes.com',
-    'https://www.wsj.com',
-    'https://www.aljazeera.com',
-    'https://www.theguardian.com',
-    'https://news.yahoo.com',
     'https://apnews.com',
-    'https://www.bloomberg.com'
+    'https://www.theguardian.com/international',
+    'https://www.npr.org',
+    'https://www.bbc.com/news'
 ]
 
 DEFAULT_TOPICS = [
@@ -39,3 +43,8 @@ DEFAULT_TOPICS = [
     'sports',
     'entertainment'
 ]
+
+# Limit articles for development
+DEV_MODE = os.getenv('DEV_MODE', 'True').lower() in ('true', '1', 't')
+MAX_ARTICLES_PER_SOURCE = 5 if DEV_MODE else 20
+MAX_ARTICLES_PER_CATEGORY = 3 if DEV_MODE else 10
