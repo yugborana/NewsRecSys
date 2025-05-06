@@ -130,3 +130,79 @@ class VectorStore:
             
             # Prepare data for Redis
             redis_data = {
+                'title': article_data.get('title', ''),
+                'text': article_data.get('text', ''),
+                'summary': article_data.get('summary', ''),
+                'source': article_data.get('source', ''),
+                'url': article_data.get('url', ''),
+                'category': article_data.get('category', ''),
+                'keywords': json.dumps(article_data.get('keywords', [])),
+                'authors': json.dumps(article_data.get('authors', [])),
+                'publish_date': article_data.get('publish_date', ''),
+                'embedding': embedding_bytes
+            }
+            
+            # Store in Redis
+            self.redis_client.hset(f"article:{article_id}", mapping=redis_data)
+            logger.info(f"Stored article {article_id} in Redis with embedding")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error storing article {article_id}: {e}")
+            return False
+    
+    def search_similar(self, query_text, limit=5, filters=None):
+        """Search for similar articles using vector similarity"""
+        try:
+            # Generate embedding for query
+            query_embedding = self.generate_embedding(query_text)
+            query_embedding_bytes = np.array(query_embedding, dtype=np.float32).tobytes()
+            
+            # Build filter string if filters are provided
+            filter_str = ""
+            if filters:
+                filter_parts = []
+                for key, value in filters.items():
+                    filter_parts.append(f"@{key}:{{{value}}}")
+                if filter_parts:
+                    filter_str = " ".join(filter_parts)
+            
+            # Execute vector search
+            query = f"*=>[KNN {limit} @embedding $embedding]"
+            if filter_str:
+                query = f"{filter_str} {query}"
+            
+            results = self.redis_client.execute_command(
+                "FT.SEARCH", REDIS_INDEX_NAME,
+                query,
+                "PARAMS", "2", "embedding", query_embedding_bytes,
+                "SORTBY", "_vector_score",
+                "LIMIT", "0", str(limit),
+                "RETURN", "7", "title", "summary", "url", "source", "category", "_vector_score", "id"
+            )
+            
+            # Parse results
+            formatted_results = []
+            if results and len(results) > 1:  # First item is count
+                for i in range(1, len(results), 2):  # Skip count and iterate through pairs
+                    article_id = results[i].decode('utf-8')
+                    article_data = {}
+                    
+                    # Convert result data to dict
+                    data = results[i+1]
+                    for j in range(0, len(data), 2):
+                        key = data[j].decode('utf-8')
+                        value = data[j+1].decode('utf-8') if data[j+1] else ""
+                        article_data[key] = value
+                    
+                    # Add score
+                    score = float(article_data.get('_vector_score', 0.0))
+                    article_data['score'] = 1.0 - score  # Convert to similarity (1.0 is perfect match)
+                    article_data['id'] = article_id.replace('article:', '')
+                    
+                    formatted_results.append(article_data)
+            
+            return formatted_results
+        except Exception as e:
+            logger.error(f"Error searching similar articles: {e}")
+            return []
